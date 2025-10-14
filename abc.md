@@ -1,181 +1,92 @@
 ```java
+package com.example.datasource;
+
+import com.example.security.DataSourceCredentialProvider;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.sql.DataSource;
+import java.io.PrintWriter;
 import java.sql.Connection;
+import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.util.Objects;
-import lombok.extern.slf4j.Slf4j;
+import java.util.Properties;
+import java.util.logging.Logger as JULLogger;
 
-/**
- * A lightweight wrapper that ensures every new connection is opened
- * with a freshly retrieved access token from the credential provider.
- */
-@Slf4j
-public class TokenAwareDataSource extends DelegatingDataSource {
+public class DynamicTokenDataSource implements DataSource {
 
-    private final DatasourceCredentialProvider credentialProvider;
-    private final boolean useAccessTokenProperty;
+    private static final Logger log = LoggerFactory.getLogger(DynamicTokenDataSource.class);
 
-    public TokenAwareDataSource(DataSource targetDataSource,
-                                DatasourceCredentialProvider credentialProvider,
-                                boolean useAccessTokenProperty) {
-        super(targetDataSource);
+    private final String jdbcUrl;
+    private final String driverClassName;
+    private final String username;
+    private final DataSourceCredentialProvider credentialProvider;
+    private final boolean useAccessToken;
+
+    public DynamicTokenDataSource(String jdbcUrl,
+                                  String driverClassName,
+                                  String username,
+                                  DataSourceCredentialProvider credentialProvider,
+                                  boolean useAccessToken) {
+        this.jdbcUrl = Objects.requireNonNull(jdbcUrl);
+        this.driverClassName = Objects.requireNonNull(driverClassName);
+        this.username = username;
         this.credentialProvider = Objects.requireNonNull(credentialProvider);
-        this.useAccessTokenProperty = useAccessTokenProperty;
+        this.useAccessToken = useAccessToken;
+
+        try {
+            Class.forName(driverClassName);
+        } catch (ClassNotFoundException e) {
+            throw new IllegalStateException("❌ JDBC driver class not found: " + driverClassName, e);
+        }
     }
 
     @Override
     public Connection getConnection() throws SQLException {
-        return prepareConnection(super.getConnection());
-    }
-
-    @Override
-    public Connection getConnection(String username, String password) throws SQLException {
-        return prepareConnection(super.getConnection(username, password));
-    }
-
-    private Connection prepareConnection(Connection conn) throws SQLException {
-        try {
-            String token = credentialProvider.getToken();
-            if (useAccessTokenProperty) {
-                // Denodo DVP expects "setClientInfo" for OAuth2 token
-                conn.setClientInfo("accessToken", token);
-                log.debug("🔐 Refreshed DVP access token on connection");
-            } else {
-                // For batch metadata case (password-based)
-                conn.setClientInfo("password", token);
-                log.debug("🔐 Refreshed batch metadata token on connection");
-            }
-        } catch (Exception e) {
-            log.error("❌ Failed to refresh token on connection: {}", e.getMessage(), e);
-            throw new SQLException("Failed to refresh access token", e);
-        }
-        return conn;
-    }
-}
-
-```
-
-```java
-import javax.sql.DataSource;
-import java.sql.Connection;
-import java.sql.SQLException;
-import java.io.PrintWriter;
-import java.util.logging.Logger;
-
-public abstract class DelegatingDataSource implements DataSource {
-
-    private final DataSource targetDataSource;
-
-    protected DelegatingDataSource(DataSource targetDataSource) {
-        this.targetDataSource = targetDataSource;
-    }
-
-    protected DataSource getTargetDataSource() {
-        return targetDataSource;
-    }
-
-    @Override
-    public Connection getConnection() throws SQLException {
-        return targetDataSource.getConnection();
-    }
-
-    @Override
-    public Connection getConnection(String username, String password) throws SQLException {
-        return targetDataSource.getConnection(username, password);
-    }
-
-    @Override
-    public <T> T unwrap(Class<T> iface) throws SQLException {
-        return targetDataSource.unwrap(iface);
-    }
-
-    @Override
-    public boolean isWrapperFor(Class<?> iface) throws SQLException {
-        return targetDataSource.isWrapperFor(iface);
-    }
-
-    @Override
-    public PrintWriter getLogWriter() throws SQLException {
-        return targetDataSource.getLogWriter();
-    }
-
-    @Override
-    public void setLogWriter(PrintWriter out) throws SQLException {
-        targetDataSource.setLogWriter(out);
-    }
-
-    @Override
-    public void setLoginTimeout(int seconds) throws SQLException {
-        targetDataSource.setLoginTimeout(seconds);
-    }
-
-    @Override
-    public int getLoginTimeout() throws SQLException {
-        return targetDataSource.getLoginTimeout();
-    }
-
-    @Override
-    public Logger getParentLogger() {
-        try {
-            return targetDataSource.getParentLogger();
-        } catch (Exception e) {
-            return Logger.getGlobal();
-        }
-    }
-}
-
-```
-
-
-```java
-@Configuration
-public class DataSourceConfiguration {
-
-    @Bean
-    @Primary
-    public DataSource batchMetadataDataSource(
-            @Qualifier("batchMetadataDataSourceProperties") DataSourceProperties dataSourceProperties,
-            @Qualifier("batchMetadataDataSourceCredentialProvider") DatasourceCredentialProvider credentialProvider,
-            Environment environment) {
-
-        HikariConfig config = new HikariConfig();
-        config.setDriverClassName(dataSourceProperties.getDriverClassName());
-        config.setJdbcUrl(dataSourceProperties.getUrl());
-        config.setUsername(dataSourceProperties.getUsername());
-
-        if (environment.acceptsProfiles(Profiles.of("local"))) {
-            config.setPassword(dataSourceProperties.getPassword());
+        String token = credentialProvider.getToken();
+        Properties props = new Properties();
+        if (username != null) props.setProperty("user", username);
+        if (useAccessToken) {
+            props.setProperty("accessToken", token);
         } else {
-            config.setPassword(credentialProvider.getToken());
+            props.setProperty("password", token);
         }
 
-        HikariDataSource hikari = new HikariDataSource(config);
-        return new TokenAwareDataSource(hikari, credentialProvider, false);
-    }
-
-    @Bean("dataVirtualizationPlatformDataSource")
-    public DataSource dataVirtualizationPlatformDataSource(
-            @Qualifier("dataVirtualizationPlatformDataSourceProperties") DataSourceProperties dataSourceProperties,
-            @Qualifier("dataVirtualizationPlatformDataSourceCredentialProvider") DatasourceCredentialProvider credentialProvider,
-            @Qualifier("dataVirtualizationPlatformDataSourceSslProperties") DataSourceSslConfigurationProperties ssl,
-            Environment environment) {
-
-        HikariConfig config = new HikariConfig();
-        config.setDriverClassName(dataSourceProperties.getDriverClassName());
-        config.setJdbcUrl(dataSourceProperties.getUrl());
-
-        config.addDataSourceProperty("useOAuth2", true);
-        config.addDataSourceProperty("accessToken", credentialProvider.getToken());
-
-        if (!environment.acceptsProfiles(Profiles.of("local"))) {
-            config.addDataSourceProperty("ssl", true);
-            config.addDataSourceProperty("sslTrustStoreLocation", ssl.getKeyStorePath());
-            config.addDataSourceProperty("sslTrustStorePassword", ssl.getKeyStorePassword());
+        try {
+            Connection conn = DriverManager.getConnection(jdbcUrl, props);
+            log.debug("✅ Created new connection for [{}]", useAccessToken ? "Denodo DVP" : "Batch Metadata");
+            return conn;
+        } catch (SQLException e) {
+            if (isTokenExpiredError(e)) {
+                log.warn("⚠️ Token expired — retrying with fresh token...");
+                String newToken = credentialProvider.refreshToken();
+                if (useAccessToken)
+                    props.setProperty("accessToken", newToken);
+                else
+                    props.setProperty("password", newToken);
+                return DriverManager.getConnection(jdbcUrl, props);
+            }
+            throw e;
         }
-
-        HikariDataSource hikari = new HikariDataSource(config);
-        return new TokenAwareDataSource(hikari, credentialProvider, true);
     }
+
+    private boolean isTokenExpiredError(SQLException e) {
+        String msg = e.getMessage();
+        return msg != null && (msg.contains("expired") || msg.contains("invalid token"));
+    }
+
+    @Override public Connection getConnection(String username, String password) throws SQLException {
+        return getConnection();
+    }
+    @Override public <T> T unwrap(Class<T> iface) { throw new UnsupportedOperationException(); }
+    @Override public boolean isWrapperFor(Class<?> iface) { return false; }
+    @Override public PrintWriter getLogWriter() { return null; }
+    @Override public void setLogWriter(PrintWriter out) {}
+    @Override public void setLoginTimeout(int seconds) {}
+    @Override public int getLoginTimeout() { return 0; }
+    @Override public JULLogger getParentLogger() { return JULLogger.getGlobal(); }
 }
+
 
 ```
